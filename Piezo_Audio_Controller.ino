@@ -3,165 +3,269 @@
 #include <SPI.h>
 #include <SD.h>
 #include <SerialFlash.h>
+#include <U8g2lib.h> 
 
-// --- GUItool生成コード（完全一致） ---
+// --- GUItool: 5オシレーター和音構成 ---
 AudioSynthNoiseWhite     noise1;
-AudioSynthWaveform       waveform1;
-AudioMixer4              mixer1;
+AudioSynthWaveform       wave1; // OSC 1 (Root)
+AudioSynthWaveform       wave2; // OSC 2 (3rd)
+AudioSynthWaveform       wave3; // OSC 3 (5th)
+AudioSynthWaveform       wave4; // OSC 4 (Octave)
+AudioSynthWaveform       wave5; // OSC 5 (Octave + 5th)
+
+AudioMixer4              mixer1; // wave1〜4をまとめる
+AudioMixer4              mixer2; // mixer1, wave5, noise をまとめる
 AudioEffectEnvelope      envelope1;
 AudioFilterLadder        ladder1;
 AudioEffectBitcrusher    bitcrusher1;
 AudioEffectFreeverb      freeverb1;
 AudioOutputUSB           usb1;
-AudioConnection          patchCord1(noise1, 0, mixer1, 1);
-AudioConnection          patchCord2(waveform1, 0, mixer1, 0);
-AudioConnection          patchCord3(mixer1, envelope1);
-AudioConnection          patchCord4(envelope1, 0, ladder1, 0);
-AudioConnection          patchCord5(ladder1, bitcrusher1);
-AudioConnection          patchCord6(bitcrusher1, freeverb1);
-AudioConnection          patchCord7(freeverb1, 0, usb1, 0);
-AudioConnection          patchCord8(freeverb1, 1, usb1, 1);
+
+// 内部配線
+AudioConnection          patchCord1(wave1, 0, mixer1, 0);
+AudioConnection          patchCord2(wave2, 0, mixer1, 1);
+AudioConnection          patchCord3(wave3, 0, mixer1, 2);
+AudioConnection          patchCord4(wave4, 0, mixer1, 3);
+AudioConnection          patchCord5(mixer1, 0, mixer2, 0);
+AudioConnection          patchCord6(wave5, 0, mixer2, 1);
+AudioConnection          patchCord7(noise1, 0, mixer2, 2);
+AudioConnection          patchCord8(mixer2, envelope1);
+AudioConnection          patchCord9(envelope1, 0, ladder1, 0);
+AudioConnection          patchCord10(ladder1, bitcrusher1);
+AudioConnection          patchCord11(bitcrusher1, freeverb1);
+AudioConnection          patchCord12(freeverb1, 0, usb1, 0);
+AudioConnection          patchCord13(freeverb1, 0, usb1, 1);
+
+// --- OLEDディスプレイ設定 ---
+U8G2_SSD1309_128X64_NONAME0_F_4W_HW_SPI u8g2(U8G2_R0, 10, 9, 8);
+
+// --- ピン定義 ---
+const int MUX_SIG = A10; 
+const int MUX_S0 = 2;
+const int MUX_S1 = 3;
+const int MUX_S2 = 4;
+const int MUX_S3 = 5;
+const int POT_PINS[5] = {A0, A1, A2, A3, A4};
+const int BTN_PINS[5] = {33, 34, 35, 36, 37};
+
+// --- UIの状態変数 ---
+int potValues[5] = {0};
+bool prevBtnStates[5] = {false};
+
+// ★ 波形モードのトラッキング (0:OFF, 1:SINE, 2:SQUARE, 3:SAW, 4:TRIANGLE)
+int oscModes[5] = {0, 0, 0, 0, 0}; 
+
+// 和音の周波数比率 (Root, 長3度, 完全5度, 1オクターブ, 1オクターブ上の5度)
+float oscRatios[5] = {1.0, 1.25, 1.5, 2.0, 3.0}; 
+AudioSynthWaveform* waves[5] = {&wave1, &wave2, &wave3, &wave4, &wave5};
 
 // --- センサー解析用変数 ---
-const int PIEZO_PIN = A0;
-const int BUFFER_SIZE = 32;
-int buffer[BUFFER_SIZE];
+// ★ C0〜C5まで読み取るために「6」に変更しました
+const int NUM_CHANNELS = 6; 
+const int BUFFER_SIZE = 16; 
+int buffers[NUM_CHANNELS][BUFFER_SIZE];
 int bufferIndex = 0;
 
 unsigned long lastStabTime = 0;
 const int COOLDOWN_MS = 100;
-bool isTouching = false; // 「触れている状態」のトラッキング
-
-// 最後のセンサー反応時間を記録する変数
+bool isTouching = false;
 unsigned long lastActiveTime = 0;
+
+unsigned long lastDisplayUpdate = 0;
+const int DISPLAY_INTERVAL = 80;
 
 void setup() {
   Serial.begin(115200);
-  AudioMemory(20); // オーディオ処理用のメモリ確保（必須）
-  pinMode(PIEZO_PIN, INPUT);
+  AudioMemory(30); 
+  u8g2.begin();
 
-  // --- シンセサイザーの初期パラメーター ---
-  // ★キラキラ感を出すため、純粋な「サイン波」に変更
-  waveform1.begin(WAVEFORM_SINE); 
-  waveform1.amplitude(0.5);
+  pinMode(MUX_SIG, INPUT);
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+
+  for (int i = 0; i < 5; i++) {
+    pinMode(BTN_PINS[i], INPUT_PULLUP); 
+    waves[i]->amplitude(0.0); // 初期状態は無音(OFF)
+  }
 
   noise1.amplitude(1.0); 
-  mixer1.gain(0, 1.0); // Waveformの音量
-  mixer1.gain(1, 0.0); // 初期状態ではNoiseをミュート
+  
+  // ミキサーの音量設定
+  for(int i=0; i<4; i++) mixer1.gain(i, 1.0);
+  mixer2.gain(0, 1.0); // OSC 1〜4
+  mixer2.gain(1, 1.0); // OSC 5
+  mixer2.gain(2, 0.0); // ノイズ
 
-  // ★空間系の要：フワッと立ち上がり、長く残るアンビエントな設定
-  envelope1.attack(150);    // 少しフワッと優しく立ち上がる
+  envelope1.attack(100);
   envelope1.hold(10);
   envelope1.decay(300);
-  envelope1.sustain(0.6);
-  envelope1.release(3000);  // ★触るのをやめた後、3秒間かけて美しく消える
+  envelope1.sustain(0.8);
+  envelope1.release(1000);
 
   ladder1.frequency(2000);
   ladder1.resonance(0.3);
-  
   bitcrusher1.bits(16);
   bitcrusher1.sampleRate(44100);
+  freeverb1.roomsize(0.85);
+  freeverb1.damping(0.2);
+}
 
-  // ★リバーブ（空間）の設定
-  freeverb1.roomsize(0.85); // 0.0〜1.0 (部屋の広さ。大きいほど大聖堂のような大空間に)
-  freeverb1.damping(0.2);   // 0.0〜1.0 (高音の吸収率。低いほど高音がキラキラと反射する)
+void selectMuxChannel(int channel) {
+  digitalWrite(MUX_S0, bitRead(channel, 0));
+  digitalWrite(MUX_S1, bitRead(channel, 1));
+  digitalWrite(MUX_S2, bitRead(channel, 2));
+  digitalWrite(MUX_S3, bitRead(channel, 3));
+  delayMicroseconds(5); 
 }
 
 void loop() {
-  // 1. バッファの更新
-  int rawValue = analogRead(PIEZO_PIN);
-  buffer[bufferIndex] = rawValue;
-  
-  // 2. 波形のピーク抽出
-  int minVal = 1023;
-  int maxVal = 0;
-  for (int i = 0; i < BUFFER_SIZE; i++) {
-    if (buffer[i] > maxVal) maxVal = buffer[i];
-    if (buffer[i] < minVal) minVal = buffer[i];
-  }
-  
-  int delta = maxVal - minVal;
-  int prevIndex = (bufferIndex - 1 + BUFFER_SIZE) % BUFFER_SIZE;
-  int instantDelta = abs(rawValue - buffer[prevIndex]);
   unsigned long currentTime = millis();
+  int activeOscCount = 0; // 現在ONになっているオシレーターの数
 
-  // ==== 【閾値キャリブレーション用】 ====
-  // プロッターに「実際の波形」と「閾値のボーダーライン」を同時に描画する
-  Serial.print("Delta:");
-  Serial.print(delta);
-  Serial.print(",");
-  Serial.print("Touch:");
-  Serial.print(15);
-  Serial.print(",");
-  Serial.print("Trace:");
-  Serial.print(5);
-  Serial.print(",");
-  Serial.print("Stab:");
-  Serial.print(150);
-  Serial.print(",");
-  Serial.print("Crush:");
-  Serial.print(800);
-  Serial.print(",");
-  Serial.print("MAX:");
-  Serial.println(1023); // ここだけ println（改行）にする
-  // =================================
+  // ==========================================
+  // 1. UI（ボタンとツマミ）の読み取り
+  // ==========================================
+  for(int i = 0; i < 5; i++) {
+    potValues[i] = analogRead(POT_PINS[i]);
+    bool isPressed = (digitalRead(BTN_PINS[i]) == LOW);
+    
+    // ボタンが押された瞬間、波形モードを切り替える
+    if(isPressed && !prevBtnStates[i]) {
+      oscModes[i] = (oscModes[i] + 1) % 5; // 0, 1, 2, 3, 4 のループ
+      
+      // モードに合わせて波形を適用
+      if(oscModes[i] == 1) waves[i]->begin(WAVEFORM_SINE);
+      else if(oscModes[i] == 2) waves[i]->begin(WAVEFORM_SQUARE);
+      else if(oscModes[i] == 3) waves[i]->begin(WAVEFORM_SAWTOOTH);
+      else if(oscModes[i] == 4) waves[i]->begin(WAVEFORM_TRIANGLE);
+    }
+    prevBtnStates[i] = isPressed;
 
-  // --- 3. 4つの状態遷移ロジック ---
+    if(oscModes[i] > 0) activeOscCount++;
+  }
 
-  // 【壊す】: 空間が歪むようなグリッチノイズ
-  if (delta > 800) {
-    bitcrusher1.bits(4); 
+  // ツマミの値をシンセに反映
+  freeverb1.roomsize(potValues[0] / 1023.0); 
+  float resValue = potValues[1] / 1023.0;    
+  envelope1.release(map(potValues[2], 0, 1023, 100, 5000)); 
+  float noiseLevel = (potValues[3] / 1023.0) * 0.8; 
+  float baseFreq = map(potValues[4], 0, 1023, 50, 880); 
+
+  // 各オシレーターの周波数と音量を更新
+  for(int i = 0; i < 5; i++) {
+    waves[i]->frequency(baseFreq * oscRatios[i]);
+    // モードが0(OFF)なら音量0、それ以外なら音量0.15
+    waves[i]->amplitude((oscModes[i] > 0) ? 0.15 : 0.0); 
+  }
+
+  // ==========================================
+  // 2. ピエゾセンサーのスキャン
+  // ==========================================
+  int maxDelta = 0; 
+  for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+    selectMuxChannel(ch); 
+    int rawValue = analogRead(MUX_SIG);
+    buffers[ch][bufferIndex] = rawValue;
+    
+    int minVal = 1023;
+    int maxVal = 0;
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+      if (buffers[ch][i] > maxVal) maxVal = buffers[ch][i];
+      if (buffers[ch][i] < minVal) minVal = buffers[ch][i];
+    }
+    int delta = maxVal - minVal;
+    if (delta > maxDelta) maxDelta = delta; 
+  }
+  bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
+
+  // ==========================================
+  // 3. 状態遷移ロジック
+  // ==========================================
+  if (maxDelta > 800) { 
     ladder1.frequency(12000); 
-    mixer1.gain(1, 0.8); 
-    envelope1.noteOn();
+    mixer2.gain(2, 1.0); 
+    if(activeOscCount == 0) envelope1.noteOn(); 
     lastStabTime = currentTime;
     lastActiveTime = currentTime;
     isTouching = true;
   }
-  // 【突き刺す】: ランダムな高音のキラキラしたチャイム音
-  else if (instantDelta > 150 && (currentTime - lastStabTime > COOLDOWN_MS)) {
-    bitcrusher1.bits(16); 
-    waveform1.frequency(random(880, 3520)); // ★高音域（ソプラノ）へランダムに飛ぶ
-    mixer1.gain(1, 0.0); // 突き刺す時は純粋なサイン波のみにする
-    envelope1.noteOn(); 
+  else if (maxDelta > 150 && (currentTime - lastStabTime > COOLDOWN_MS)) {
+    ladder1.frequency(8000);
+    mixer2.gain(2, noiseLevel + 0.5); 
+    if(activeOscCount == 0) envelope1.noteOn();
     lastStabTime = currentTime;
     lastActiveTime = currentTime;
     isTouching = true;
   }
-  // 【なぞる】: サァーッという風のような広がり
-  else if (delta > 5) {
-    bitcrusher1.bits(16);
-    if (!isTouching) { envelope1.noteOn(); isTouching = true; } 
+  else if (maxDelta > 15) {
+    if(activeOscCount == 0 && !isTouching) { envelope1.noteOn(); isTouching = true; } 
     lastActiveTime = currentTime;
     
-    // 摩擦の音を高音域のフィルターでシュワシュワさせる
-    float cutoff = map(delta, 5, 30, 1000, 8000);
+    float cutoff = map(maxDelta, 5, 30, baseFreq * 2, 8000);
     if (cutoff > 8000) cutoff = 8000;
-    if (cutoff < 1000) cutoff = 1000;
-
     ladder1.frequency(cutoff);
-    ladder1.resonance(0.6); 
-    mixer1.gain(1, 0.3); // 風のようなノイズを混ぜる
+    ladder1.resonance(resValue); 
+    mixer2.gain(2, noiseLevel * 0.5); 
   }
-  // 【触る】: 澄んだクリスタルのような持続音
-  else if (delta > 2) {
-    bitcrusher1.bits(16);
-    if (!isTouching) { envelope1.noteOn(); isTouching = true; }
-    lastActiveTime = currentTime;
-
-    waveform1.frequency(880.0); // ★基本の音を高めの澄んだ音（A5）に設定
-    ladder1.frequency(3000); 
-    ladder1.resonance(0.1);
-    mixer1.gain(1, 0.05); // ノイズはほぼ無し
-  }
-  // 【沈黙】
   else {
-    if (isTouching && (currentTime - lastActiveTime > 2000)) {
-      envelope1.noteOff(); 
-      isTouching = false;
+    if (activeOscCount > 0) {
+      if (!isTouching) { envelope1.noteOn(); isTouching = true; }
+      ladder1.frequency(baseFreq * 3); 
+      ladder1.resonance(resValue); 
+      mixer2.gain(2, noiseLevel * 0.1); 
+      lastActiveTime = currentTime;
+    } else {
+      if (isTouching && (currentTime - lastActiveTime > 200)) {
+        envelope1.noteOff(); 
+        isTouching = false;
+      }
     }
   }
 
-  bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
-  delay(2);
+  // ==========================================
+  // 4. OLEDディスプレイの更新
+  // ==========================================
+  if (currentTime - lastDisplayUpdate > DISPLAY_INTERVAL) {
+    lastDisplayUpdate = currentTime;
+    
+    u8g2.clearBuffer(); 
+    u8g2.setFont(u8g2_font_5x7_tr); // はみ出さない小さなフォント
+
+    // --- 上段：各オシレーターの波形状態 ---
+    u8g2.setCursor(0, 8);
+    u8g2.print("OSC:");
+    for(int i = 0; i < 5; i++) {
+      int x = 23 + (i * 21); // 横に21ピクセル刻みで均等配置
+      if(oscModes[i] > 0) {
+        u8g2.drawBox(x, 0, 19, 10); // 背景を白塗り
+        u8g2.setDrawColor(0); // 文字を黒に反転
+        u8g2.setCursor(x + 2, 8);
+        if(oscModes[i] == 1) u8g2.print("SIN");
+        else if(oscModes[i] == 2) u8g2.print("SQR");
+        else if(oscModes[i] == 3) u8g2.print("SAW");
+        else if(oscModes[i] == 4) u8g2.print("TRI");
+        u8g2.setDrawColor(1); // 白に戻す
+      } else {
+        u8g2.drawFrame(x, 0, 19, 10); // 枠線のみ
+        u8g2.setCursor(x + 3, 8);
+        u8g2.print("---"); // OFF状態
+      }
+    }
+
+    // --- 下段：ツマミの値を横棒グラフで表示 ---
+    const char* labels[] = {"Rvb", "Res", "Rel", "Noi", "Frq"};
+    for(int i = 0; i < 5; i++) {
+      int y = 20 + (i * 10); // 10ピクセル刻み（見切れ防止）
+      u8g2.setCursor(0, y);
+      u8g2.print(labels[i]); 
+      
+      int barWidth = map(potValues[i], 0, 1023, 0, 90); 
+      u8g2.drawFrame(25, y - 6, 90, 6); 
+      u8g2.drawBox(25, y - 6, barWidth, 6); 
+    }
+
+    u8g2.sendBuffer(); 
+  }
 }
