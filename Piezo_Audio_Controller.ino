@@ -35,7 +35,7 @@ const int THRESHOLD_TOUCH = 50;   // 触れる
 const int THRESHOLD_TRACE = 100;  // なぞる
 const int THRESHOLD_STAB  = 200;  // 突き刺す
 const int THRESHOLD_TEAR  = 350;  // 破る
-const int THRESHOLD_CRUSH = 500;  // 壊す
+const int THRESHOLD_CRUSH = 500;  // 壊す________________//////
 
 // ==========================================
 // 音響モジュール
@@ -158,7 +158,7 @@ const int MUX_S3 = 5;
 
 const int POT_PINS[10] = {
   A0, A1, A2, A3, A4,
-  A5, A6, A7, A8, A9
+  A5, A6, A16, A8, A17
 };
 
 const int BTN_PINS[10] = {
