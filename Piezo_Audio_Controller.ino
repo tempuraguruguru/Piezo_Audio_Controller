@@ -1,4 +1,3 @@
-
 #include <Audio.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -31,11 +30,11 @@ unsigned long lastWaveSend = 0;
 // ==========================================
 // 衝撃閾値（高感度設定）
 // ==========================================
-const int THRESHOLD_TOUCH = 50;   // 触れる
-const int THRESHOLD_TRACE = 100;  // なぞる
-const int THRESHOLD_STAB  = 200;  // 突き刺す
-const int THRESHOLD_TEAR  = 350;  // 破る
-const int THRESHOLD_CRUSH = 500;  // 壊す________________//////
+const int THRESHOLD_TOUCH = 80;   // 触れる
+const int THRESHOLD_TRACE = 120;  // なぞる
+const int THRESHOLD_STAB  = 150;  // 突き刺す
+const int THRESHOLD_TEAR  = 200;  // 破る
+const int THRESHOLD_CRUSH = 250;  // 壊す________________//////
 
 // ==========================================
 // 音響モジュール
@@ -173,12 +172,13 @@ enum SystemMode {
   MODE_RESET,
   MODE_EDIT,
   MODE_LOCKED,
+  MODE_MEMORY,
   MODE_SOMEONE
 };
 
 SystemMode currentMode = MODE_EDIT;
 
-String displayMessage = "設定モード";
+String displayMessage = "音作成モード";
 
 unsigned long messageTimer = 0;
 unsigned long lastActiveTime = 0;
@@ -191,6 +191,66 @@ float params[10] = {
   0.5, 0.5, 0.5, 0.5, 0.5,
   0.5, 0.5, 0.5, 0.5, 0.5
 };
+
+// ★ツマミ変更検知・OLED表示用
+float lastPotValues[10] = {
+  0.5, 0.5, 0.5, 0.5, 0.5,
+  0.5, 0.5, 0.5, 0.5, 0.5
+};
+
+int activePotIndex = -1;
+// ノイズによる誤検知を防ぐため、変化検知のしきい値を少し高めに設定（5%以上の変化で反応）
+const float POT_CHANGE_THRESHOLD = 0.05f;
+
+const char* const POT_QUESTIONS[10] = {
+  "丸い / 尖る",
+  "ひとり / だれか",
+  "隠れる / 目立つ",
+  "浮く / 沈む",
+  "すっきり/ぐちゃぐちゃ",
+  "忘れる / 引きずる",
+  "冷たい / あたたかい",
+  "カツカツ / ゆとり",
+  "漂う / 刻む",
+  "馴染む / はみだす"
+};
+
+const char* const POT_NAMES[10] = {
+  "A0",
+  "A1",
+  "A2",
+  "A3",
+  "A4",
+  "A5",
+  "A6",
+  "A16(A7)",
+  "A8",
+  "A17(A9)"
+};
+
+// 「記憶モード」で保存し「誰かモード」で呼び出すパラメータ
+float savedParams[10] = {
+  0.75, 0.85, 0.70, 0.30, 0.65,
+  0.80, 0.25, 0.20, 0.80, 0.60
+};
+
+// ==========================================
+// ★記憶ファイル管理（重複ファイルの自動削除）
+// ==========================================
+const int MAX_MEMORY_FILES = 32;
+const float PARAM_MATCH_EPSILON = 0.01f;
+
+struct ParamFile {
+  bool active;
+  char filename[16];
+  float values[10];
+};
+
+ParamFile memoryFiles[MAX_MEMORY_FILES];
+int memoryFileCount = 0;
+int nextFileId = 1;
+int currentSomeoneIndex = 0;
+bool sdAvailable = false;
 
 int fakeTriggerForce = 0;
 float currentPeak = 0.0;
@@ -219,6 +279,191 @@ float mapFloat(
   return (x - inMin) *
          (outMax - outMin) /
          (inMax - inMin) + outMin;
+}
+
+// ==========================================
+// ★2つのファイルの全10パラメータが同一か判定
+// ==========================================
+bool isSameParameterSet(
+  const float a[10],
+  const float b[10]
+) {
+  for (int p = 0; p < 10; p++) {
+    if (fabs(a[p] - b[p]) > PARAM_MATCH_EPSILON) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ==========================================
+// ★全て同じパラメータを持つ重複ファイルを自動削除
+// ==========================================
+int removeDuplicateFiles() {
+
+  int removedCount = 0;
+
+  for (int i = 0; i < memoryFileCount; i++) {
+
+    for (int j = i + 1; j < memoryFileCount; ) {
+
+      if (
+        isSameParameterSet(
+          memoryFiles[i].values,
+          memoryFiles[j].values
+        )
+      ) {
+
+        // SDカード上の重複ファイルも削除
+        if (
+          sdAvailable &&
+          SD.exists(memoryFiles[j].filename)
+        ) {
+          SD.remove(memoryFiles[j].filename);
+        }
+
+        // リストを詰めて重複分を削除（1つだけ残す）
+        for (int k = j; k < memoryFileCount - 1; k++) {
+          memoryFiles[k] = memoryFiles[k + 1];
+        }
+
+        memoryFileCount--;
+        removedCount++;
+
+      } else {
+        j++;
+      }
+    }
+  }
+
+  if (
+    currentSomeoneIndex >= memoryFileCount &&
+    memoryFileCount > 0
+  ) {
+    currentSomeoneIndex = 0;
+  }
+
+  return removedCount;
+}
+
+// ==========================================
+// ★記憶モード：新規ファイル保存＋重複の自動削除
+// ==========================================
+void saveMemoryFile() {
+
+  // 上限に達している場合は最も古いファイルを削除して空ける
+  if (memoryFileCount >= MAX_MEMORY_FILES) {
+
+    if (
+      sdAvailable &&
+      SD.exists(memoryFiles[0].filename)
+    ) {
+      SD.remove(memoryFiles[0].filename);
+    }
+
+    for (int k = 0; k < memoryFileCount - 1; k++) {
+      memoryFiles[k] = memoryFiles[k + 1];
+    }
+
+    memoryFileCount = MAX_MEMORY_FILES - 1;
+  }
+
+  ParamFile &newFile = memoryFiles[memoryFileCount];
+  newFile.active = true;
+  snprintf(
+    newFile.filename,
+    sizeof(newFile.filename),
+    "MEM_%03d.TXT",
+    nextFileId++
+  );
+
+  for (int p = 0; p < 10; p++) {
+    newFile.values[p] = params[p];
+    savedParams[p] = params[p];
+  }
+
+  if (sdAvailable) {
+    File f = SD.open(newFile.filename, FILE_WRITE);
+    if (f) {
+      for (int p = 0; p < 10; p++) {
+        f.println(newFile.values[p], 4);
+      }
+      f.close();
+    }
+  }
+
+  memoryFileCount++;
+
+  // 全て同じパラメータを持つファイルが2つ以上ある場合、自動的に削除
+  removeDuplicateFiles();
+}
+
+// ==========================================
+// ★起動時の記憶ファイル初期化・重複クリーンアップ
+// ==========================================
+void initializeMemoryFiles() {
+
+#ifdef BUILTIN_SDCARD
+  sdAvailable = SD.begin(BUILTIN_SDCARD);
+#else
+  sdAvailable = false;
+#endif
+
+  if (sdAvailable) {
+    File root = SD.open("/");
+    if (root) {
+      while (true) {
+        File entry = root.openNextFile();
+        if (!entry) break;
+
+        if (!entry.isDirectory()) {
+          const char *name = entry.name();
+          if (
+            strncmp(name, "MEM_", 4) == 0 &&
+            memoryFileCount < MAX_MEMORY_FILES
+          ) {
+            ParamFile &pf = memoryFiles[memoryFileCount];
+            pf.active = true;
+            strncpy(
+              pf.filename,
+              name,
+              sizeof(pf.filename) - 1
+            );
+            pf.filename[sizeof(pf.filename) - 1] = '\0';
+
+            for (int p = 0; p < 10; p++) {
+              if (entry.available()) {
+                pf.values[p] = entry.parseFloat();
+              } else {
+                pf.values[p] = 0.5f;
+              }
+            }
+            memoryFileCount++;
+            nextFileId++;
+          }
+        }
+        entry.close();
+      }
+      root.close();
+    }
+  }
+
+  // 起動時にも同一パラメータの重複ファイルが2つ以上あれば自動削除
+  removeDuplicateFiles();
+
+  // ファイルが1つもない場合は初期の「誰か」パラメータを1件登録
+  if (memoryFileCount == 0) {
+    memoryFileCount = 1;
+    memoryFiles[0].active = true;
+    snprintf(
+      memoryFiles[0].filename,
+      sizeof(memoryFiles[0].filename),
+      "MEM_000.TXT"
+    );
+    for (int p = 0; p < 10; p++) {
+      memoryFiles[0].values[p] = savedParams[p];
+    }
+  }
 }
 
 // ==========================================
@@ -289,19 +534,27 @@ void setup() {
     pinMode(BTN_PINS[i], INPUT_PULLUP);
   }
 
+  // 起動時のツマミ初期位置を記録
+  for (int i = 0; i < 10; i++) {
+    float initVal = analogRead(POT_PINS[i]) / 1023.0f;
+    params[i] = initVal;
+    lastPotValues[i] = initVal;
+  }
+
   initializePiezoBuffers();
+  initializeMemoryFiles();
 
   // ========================================
   // 音響初期化
   // ========================================
 
   waveMain.begin(WAVEFORM_SAWTOOTH);
-  waveSub.begin(WAVEFORM_SQUARE);
+  waveSub.begin(WAVEFORM_SAWTOOTH);
 
   noise1.amplitude(1.0);
 
   oscMixer.gain(0, 1.0);
-  oscMixer.gain(1, 0.0);
+  oscMixer.gain(1, 0.5);
 
   mainMixer.gain(0, 1.0);
   mainMixer.gain(1, 0.0);
@@ -309,22 +562,23 @@ void setup() {
   delayMixer.gain(0, 1.0);
   delayMixer.gain(1, 0.0);
 
-  ladder1.frequency(1000);
+  ladder1.frequency(2500);
   ladder1.resonance(0.5);
 
   bitcrusher1.bits(16);
   bitcrusher1.sampleRate(44100);
 
   // ディレイ時間
-  delay1.delay(0, 180);
+  delay1.delay(0, 240);
 
   freeverb1.roomsize(0.6);
+  freeverb1.damping(0.2);
 
   // エンベロープ
   envelope1.attack(20);
-  envelope1.decay(50);
+  envelope1.decay(100);
   envelope1.sustain(0.8);
-  envelope1.release(300);
+  envelope1.release(400);
 
   lastWaveSend = millis();
 }
@@ -343,17 +597,25 @@ void updateButtons(unsigned long currentTime) {
 
     if (isPressed && !prevBtnStates[i]) {
 
+      activePotIndex = -1;
+
       switch (i) {
 
         case 0:
           currentMode = MODE_RESET;
+          for (int p = 0; p < 10; p++) {
+            params[p] = 0.5f;
+          }
           displayMessage = "[ 私 ]";
           messageTimer = currentTime;
           break;
 
         case 1:
           currentMode = MODE_EDIT;
-          displayMessage = "設定モード";
+          for (int p = 0; p < 10; p++) {
+            lastPotValues[p] = params[p];
+          }
+          displayMessage = "音作成モード";
           messageTimer = currentTime;
           break;
 
@@ -392,6 +654,29 @@ void updateButtons(unsigned long currentTime) {
           displayMessage = "固定中";
           messageTimer = currentTime;
           break;
+
+        case 8:
+          currentMode = MODE_MEMORY;
+          saveMemoryFile();
+          displayMessage = "記憶モード";
+          messageTimer = currentTime;
+          break;
+
+        case 9:
+          currentMode = MODE_SOMEONE;
+          removeDuplicateFiles();
+          if (memoryFileCount > 0) {
+            currentSomeoneIndex =
+              (currentSomeoneIndex + 1) % memoryFileCount;
+            for (int p = 0; p < 10; p++) {
+              params[p] =
+                memoryFiles[currentSomeoneIndex].values[p];
+              savedParams[p] = params[p];
+            }
+          }
+          displayMessage = "[ 誰か ]";
+          messageTimer = currentTime;
+          break;
       }
     }
 
@@ -400,7 +685,7 @@ void updateButtons(unsigned long currentTime) {
 }
 
 // ==========================================
-// ツマミ入力
+// ツマミ入力（感度を改善しノイズによる誤表示を防止）
 // ==========================================
 void updatePots() {
 
@@ -408,12 +693,20 @@ void updatePots() {
     return;
   }
 
+  unsigned long now = millis();
+
   for (int i = 0; i < 10; i++) {
 
-    // ツマミ接続時は次の行を有効化
-    // params[i] = analogRead(POT_PINS[i]) / 1023.0f;
+    float raw = analogRead(POT_PINS[i]) / 1023.0f;
+    params[i] = params[i] * 0.8f + raw * 0.2f;
 
-    params[i] = 0.5f;
+    // 設定値（5%以上）を変更したときだけOLEDの表示を切り替える
+    if (fabs(params[i] - lastPotValues[i]) >= POT_CHANGE_THRESHOLD) {
+      lastPotValues[i] = params[i];
+      activePotIndex = i;
+      displayMessage = POT_QUESTIONS[i];
+      messageTimer = now;
+    }
   }
 }
 
@@ -422,40 +715,77 @@ void updatePots() {
 // ==========================================
 void updateAudioParameters(unsigned long currentTime) {
 
+  if (params[0] < 0.2f && params[8] < 0.4f) {
+    waveMain.begin(WAVEFORM_SINE);
+  } else if (params[0] > 0.65f || params[8] > 0.7f) {
+    waveMain.begin(WAVEFORM_SAWTOOTH);
+  } else {
+    waveMain.begin(WAVEFORM_TRIANGLE);
+  }
+
   int bits = (int)mapFloat(
-    params[0], 0, 1, 16, 3
+    params[0], 0.0f, 1.0f, 16.0f, 3.0f
+  );
+  float crushRate = mapFloat(
+    params[0], 0.0f, 1.0f, 44100.0f, 2400.0f
   );
 
   bitcrusher1.bits(bits);
+  bitcrusher1.sampleRate(crushRate);
 
-  freeverb1.roomsize(params[1]);
+  freeverb1.roomsize(mapFloat(params[1], 0.0f, 1.0f, 0.0f, 0.98f));
+  freeverb1.damping(mapFloat(params[1], 0.0f, 1.0f, 0.85f, 0.05f));
 
-  oscMixer.gain(1, params[3]);
+  oscMixer.gain(1, mapFloat(params[3], 0.0f, 1.0f, 0.05f, 1.0f));
 
-  delayMixer.gain(1, params[5] * 0.8f);
+  float chaos1 = sin(currentTime / 170.0f);
+  float chaos2 = sin(currentTime / 43.0f);
+  float chaos3 = cos(currentTime / 19.0f);
+  float wobble =
+    (chaos1 * 0.5f + chaos2 * 0.3f + chaos3 * 0.2f) *
+    (params[4] * params[4] * 140.0f);
+
+  delayMixer.gain(1, mapFloat(params[5], 0.0f, 1.0f, 0.0f, 0.93f));
 
   envelope1.attack(
-    mapFloat(params[7], 0, 1, 5, 1000)
+    mapFloat(params[7], 0.0f, 1.0f, 2.0f, 900.0f)
+  );
+  envelope1.decay(
+    mapFloat(params[7], 0.0f, 1.0f, 30.0f, 400.0f)
+  );
+  envelope1.sustain(
+    mapFloat(params[7], 0.0f, 1.0f, 0.4f, 0.9f)
+  );
+  envelope1.release(
+    mapFloat(params[7], 0.0f, 1.0f, 90.0f, 1200.0f)
   );
 
   float vitality = mapFloat(
-    params[8], 0, 1, 0.2f, 0.8f
+    params[8], 0.0f, 1.0f, 0.15f, 0.90f
   );
 
-  float detune = mapFloat(
-    params[9], 0, 1, 1.0f, 1.05f
+  if (params[8] > 0.6f) {
+    waveSub.begin(WAVEFORM_SQUARE);
+  } else {
+    waveSub.begin(WAVEFORM_SAWTOOTH);
+  }
+
+  float gravityPitch = mapFloat(
+    params[3], 0.0f, 1.0f, 440.0f, 165.0f
   );
 
-  float wobble =
-    sin(currentTime / 200.0f) *
-    (params[4] * 50.0f);
+  float basePitch = gravityPitch + wobble;
+  if (basePitch < 40.0f) {
+    basePitch = 40.0f;
+  }
 
-  float basePitch = 110.0f + wobble;
+  float cleanHarmony = (params[3] < 0.5f) ? 1.5f : 0.5f;
+  float outcastDetune = params[9] * 0.21f;
 
   waveMain.frequency(basePitch);
 
   waveSub.frequency(
-    basePitch * 1.5f * detune
+    basePitch * (cleanHarmony + outcastDetune)
   );
 
   waveMain.amplitude(vitality);
@@ -520,11 +850,23 @@ void processImpact(
 ) {
 
   float baseResonance = mapFloat(
-    params[2], 0, 1, 0.1f, 0.9f
+    params[2], 0.0f, 1.0f, 0.05f, 0.92f
   );
 
-  float baseCutoff = mapFloat(
-    params[6], 0, 1, 300, 2000
+  float prideCutoff = mapFloat(
+    params[2], 0.0f, 1.0f, 220.0f, 6500.0f
+  );
+
+  float warmthFactor = mapFloat(
+    params[6], 0.0f, 1.0f, 1.8f, 0.55f
+  );
+  float baseCutoff = prideCutoff * warmthFactor;
+
+  float warmthResMod = mapFloat(
+    params[6], 0.0f, 1.0f, 0.1f, -0.15f
+  );
+  baseResonance = constrain(
+    baseResonance + warmthResMod, 0.05f, 0.94f
   );
 
   if (finalImpact >= THRESHOLD_TOUCH) {
@@ -533,48 +875,60 @@ void processImpact(
     float impactCutoffAdd = 0.0;
     float impactResAdd = 0.0;
 
+    float sharpness =
+      mapFloat(params[0], 0.0f, 1.0f, 0.3f, 1.5f) *
+      mapFloat(params[6], 0.0f, 1.0f, 1.3f, 0.4f);
+
     if (finalImpact >= THRESHOLD_CRUSH) {
 
-      impactNoise = 1.0;
-      impactCutoffAdd = 10000;
-      impactResAdd = 0.8;
+      impactNoise = constrain(0.45f * sharpness, 0.0f, 1.0f);
+      impactCutoffAdd = 9000;
+      impactResAdd = 0.45;
 
     } else if (finalImpact >= THRESHOLD_TEAR) {
 
-      impactNoise = 0.6;
-      impactCutoffAdd = 8000;
-      impactResAdd = 0.5;
+      impactNoise = constrain(0.30f * sharpness, 0.0f, 1.0f);
+      impactCutoffAdd = 7000;
+      impactResAdd = 0.35;
 
     } else if (finalImpact >= THRESHOLD_STAB) {
 
-      impactNoise = 0.2;
-      impactCutoffAdd = 6000;
-      impactResAdd = 0.3;
+      impactNoise = constrain(0.15f * sharpness, 0.0f, 1.0f);
+      impactCutoffAdd = 5000;
+      impactResAdd = 0.25;
 
     } else if (finalImpact >= THRESHOLD_TRACE) {
 
-      impactNoise = 0.05;
+      impactNoise = constrain(0.05f * sharpness, 0.0f, 1.0f);
       impactCutoffAdd = 3000;
-      impactResAdd = 0.1;
+      impactResAdd = 0.15;
 
     } else {
 
       impactNoise = 0.0;
-      impactCutoffAdd = 1000;
-      impactResAdd = 0.0;
+      impactCutoffAdd = 1200;
+      impactResAdd = 0.05;
     }
 
     mainMixer.gain(1, impactNoise);
 
-    ladder1.frequency(
-      baseCutoff + impactCutoffAdd
+    float claimScale = mapFloat(
+      params[2], 0.0f, 1.0f, 0.25f, 1.2f
     );
+    float targetCutoff =
+      baseCutoff + (impactCutoffAdd * claimScale);
+
+    if (targetCutoff > 14000.0f) {
+      targetCutoff = 14000.0f;
+    }
+
+    ladder1.frequency(targetCutoff);
 
     float resonance =
-      baseResonance + impactResAdd;
+      baseResonance + (impactResAdd * claimScale);
 
-    if (resonance > 1.0f) {
-      resonance = 1.0f;
+    if (resonance > 0.95f) {
+      resonance = 0.95f;
     }
 
     ladder1.resonance(resonance);
@@ -610,8 +964,6 @@ void processImpact(
 // ==========================================
 void captureAudioWaveform() {
 
-  // キューに届いた128サンプル単位の
-  // 音声データを取り出す
   while (audioQueue.available() > 0) {
 
     int16_t *samples =
@@ -625,7 +977,6 @@ void captureAudioWaveform() {
         i += WAVE_DECIMATION
       ) {
 
-        // 実際の16bit PCM値
         waveBuffer[waveBufferIndex] =
           samples[i];
 
@@ -639,7 +990,6 @@ void captureAudioWaveform() {
       }
     }
 
-    // AudioMemoryへ返却
     audioQueue.freeBuffer();
   }
 }
@@ -664,15 +1014,12 @@ void sendAudioWaveform(unsigned long currentTime) {
 
   if (Serial) {
 
-    // 256個のPCM値を連続出力
-    // 1行 = 波形の1サンプル
     for (int i = 0; i < WAVE_POINTS; i++) {
 
       Serial.println(waveBuffer[i]);
     }
   }
 
-  // 次の波形取得へ
   waveBufferIndex = 0;
   waveBufferReady = false;
 }
@@ -692,10 +1039,12 @@ void updateDisplay(unsigned long currentTime) {
 
   if (currentTime - messageTimer > 2000) {
 
+    activePotIndex = -1;
+
     switch (currentMode) {
 
       case MODE_EDIT:
-        displayMessage = "設定モード";
+        displayMessage = "音作成モード";
         break;
 
       case MODE_LOCKED:
@@ -706,8 +1055,12 @@ void updateDisplay(unsigned long currentTime) {
         displayMessage = "[ 私 ]";
         break;
 
+      case MODE_MEMORY:
+        displayMessage = "記憶モード";
+        break;
+
       case MODE_SOMEONE:
-        displayMessage = "[ 誰か ]";
+        displayMessage = "[ だれか ]";
         break;
     }
   }
@@ -754,6 +1107,17 @@ void updateDisplay(unsigned long currentTime) {
   u8g2.setCursor(65, 48);
   u8g2.print("S:");
   u8g2.print(maxDelta);
+
+  // ツマミ名と現在値(%)を下段に表示
+  if (activePotIndex >= 0 && activePotIndex < 10) {
+    int pct = (int)(params[activePotIndex] * 100.0f + 0.5f);
+    u8g2.setCursor(0, 62);
+    u8g2.print("KNOB ");
+    u8g2.print(POT_NAMES[activePotIndex]);
+    u8g2.print(" : ");
+    u8g2.print(pct);
+    u8g2.print("%");
+  }
 
   u8g2.sendBuffer();
 }
